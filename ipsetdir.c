@@ -50,22 +50,6 @@ static void fix_char(char *str) {
   }
 }
 
-static int check_exist_ipset(char *setname) {
-char *arg[6];
-int r;
-
-ipset_parse_file(NULL,0,"/dev/zero");
-arg[0]="ipset";
-arg[1]="save";
-arg[2]=setname;
-arg[3]=NULL;
-r = ipset_parse_commandline(3,arg);
-if(r < 0)
-        ipset_session_reset();
-ipset_session_fdclose();
-return r == 0;
-}
-
 static int ipset_parse_cmd(char *cmd,char *setname,char *setarg) {
 char *arg[5],*sa,*sn;
 int r;
@@ -266,6 +250,7 @@ struct inotify_event * event;
 int i,fd,wd,len,c;
 int set_flush = 0, dodaemon = 1;
 int del;
+char est[128];
 
 	if(ipset_init_lib()) {
 		fprintf(stderr,"Initialize ipset library failed.\n");
@@ -283,19 +268,23 @@ int del;
 	}
 	}
 
-	if(!w_set || !argv[optind]) {
+	if(!w_set || !argv[optind]) 
 		help();
-	}
-	if(!pid_file[0]) {
+	
+	if(!pid_file[0])
 		snprintf(pid_file,sizeof(pid_file)-1,"/run/ipset_dir_%s.pid",w_set);
-	}
+
 	if(is_valid_pidfile(pid_file)) {
 		fprintf(stderr,"Found valid PID file %s\n",pid_file);
 		exit(1);
 	}
 
-	if(!check_exist_ipset(w_set))
+	if(!ipset_exist(w_set,est,sizeof(est)-1))
 		create_ipset(w_set,w_type);
+	else if(strcmp(est,w_type)) {
+		fprintf(stderr,"ipset %s have type %s != %s\n",w_set,est,w_type);
+		exit(1);
+	}
 
 	flush_ipset(w_set);
 
