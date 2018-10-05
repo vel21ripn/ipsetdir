@@ -1,4 +1,0 @@
-1. Download the ipset source code. Version 6.30 or higher is recommended.
-2. Apply patch ipsetsharedlib.diff
-3. Rebuild ipset (autogen.sh && configure).
-4. [Re]install ipset.
