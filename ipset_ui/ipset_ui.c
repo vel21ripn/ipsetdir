@@ -228,28 +228,36 @@ int ipset_save(struct ipset_session **session,char *setname) {
 	return ret == 0;
 }
 
+static int _ipset_adt_verbose = 0;
 
 static int _ipset_adt(struct ipset_session *session,int cmd,char *setname,char *buf) {
 	int ret;
 	static uint32_t restore_line=0;
 	const struct ipset_type *type = NULL;
+	int set_cmd = cmd & ~0xC000;
 
+	cmd |= _ipset_adt_verbose;
 	ipset_session_report_reset(session);
 	ipset_data_reset(ipset_session_data(session));
 
 	ret = ipset_parse_setname(session, IPSET_SETNAME, setname);
 
-	type = ret >= 0 ? ipset_type_get(session, cmd) : NULL;
+	type = ret >= 0 ? ipset_type_get(session, set_cmd) : NULL;
 
 	if(type) {
 		ret = ipset_parse_elem(session, type->last_elem_optional, buf);
+		if(cmd & 0x8000) {
+			if(cmd & 0x4000) 
+				printf("VALIDATE(%s,%s) = %s\n", setname,buf,ret == 0 ? "OK":"ERR");
+			return ret == 0;
+		}
 		if(ret >= 0)
-			ret = ipset_cmd(session, cmd, restore_line);
+			ret = ipset_cmd(session, set_cmd, restore_line);
 		if(ret < 0)
 			ipset_session_report_reset(session);
 	}
-	printf("%s(%s,%s) = %s\n",
-			cmd == IPSET_CMD_TEST ? "test":(cmd == IPSET_CMD_ADD ? "add":"del"),
+	if(cmd & 0x4000) printf("%s(%s,%s) = %s\n",
+			set_cmd == IPSET_CMD_TEST ? "test":(set_cmd == IPSET_CMD_ADD ? "add":"del"),
 			setname,buf,ret == 0 ? "OK":"ERR");
 	return ret == 0;
 }
@@ -263,15 +271,19 @@ int ipset_add(struct ipset_session *session,char *setname,char *buf) {
 int ipset_del(struct ipset_session *session,char *setname,char *buf) {
 	return _ipset_adt(session,IPSET_CMD_DEL,setname,buf);
 }
+int ipset_validate(struct ipset_session *session,char *setname,char *buf) {
+	return _ipset_adt(session,IPSET_CMD_TEST | 0x8000,setname,buf);
+}
 
 #ifdef IPSET_LIB_TEST
 int main(int argc,char **argv) {
 int t = 0;
 char est[128];
-char *w_set = "AAA", *w_type="hash:ip", *w_set2 = "AAA1";
+char *w_set = "AAA", *w_type="hash:ip", *w_set2 = "AAA1", *w_set3="AAM", *w_type3="hash:mac";
 
 struct ipset_session *session;
 
+_ipset_adt_verbose = 0x4000;
 ipset_load_types();
 session = ipset_session_init(printf);
 
@@ -296,6 +308,13 @@ if(!ipset_exist(session,w_set,est,sizeof(est)-1)) {
 }
 printf("Set '%s' type %s\n",w_set,est);
 
+if(!ipset_exist(session,w_set3,NULL,0)) {
+	ipset_create(session,w_set3,w_type3,NULL,0);
+}
+ipset_add(session,w_set3,"00:11:22:33:44:55");
+ipset_test(session,w_set3,"00:11:22:33:44:55");
+ipset_validate(session,w_set3,"00:11:22:33:44:zz");
+
 for(t=0; t < 3; t++) {
 	printf("%d\n",t);
 	ipset_test(session,w_set,"10.0.0.121");
@@ -307,6 +326,8 @@ for(t=0; t < 3; t++) {
 	ipset_test(session,w_set,"10.0.0.122");
 	ipset_test(session,w_set,"10.0.0.123");
 }
+ipset_validate(session,w_set,"10.0.0.123");
+ipset_validate(session,w_set,"10.0.0.123a");
 
 if(!ipset_exist(session,w_set,est,sizeof(est)-1)) {
 	printf("not exist %s - OK\n",w_set);

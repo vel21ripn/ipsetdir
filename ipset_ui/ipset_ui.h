@@ -12,6 +12,7 @@ int ipset_flush(struct ipset_session *session,char *setname);
 int ipset_destroy(struct ipset_session *session,char *setname);
 int ipset_list(struct ipset_session **session,char *setname);
 int ipset_save(struct ipset_session **session,char *setname);
+int ipset_validate(struct ipset_session *session,char *setname,char *buf);
 int ipset_test(struct ipset_session *session,char *setname,char *buf);
 int ipset_add(struct ipset_session *session,char *setname,char *buf);
 int ipset_del(struct ipset_session *session,char *setname,char *buf);
