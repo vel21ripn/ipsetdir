@@ -130,6 +130,9 @@ static int set_ip_type() {
 	return 0;
 }
 
+#if 0
+//{{{{
+
 static int is_any_ip(char *str) {
 	char a_buf[16];
 	return str ? inet_pton(AF_INET,str,a_buf) ||
@@ -175,6 +178,7 @@ static int is_ether(char *str) {
 	return 0;
 }
 
+
 static int match_ip_type(char *str) {
 
 	switch(w_type_id) {
@@ -188,8 +192,6 @@ static int match_ip_type(char *str) {
 	}
 	return 0;
 }
-#if 0
-//{{{{
 
 static int ipset_parse_cmd(char *cmd,char *setname,char *setarg) {
 char *arg[5],*sa,*sn;
@@ -263,24 +265,29 @@ return r >= 0;
 
 static void event_handler(char *f_name,int del) {
   char a_buf[64];
+  int e;
 	strncpy(a_buf,f_name,sizeof(a_buf)-1);
 	fix_char(a_buf);
-	if(!match_ip_type(a_buf)) {
+	if(!ipset_validate(session,w_set,a_buf)) {
 		if(debug)
 			fprintf(stderr,"Invalid address %s\n",a_buf);
 		return;
 	}
-
+	e = ipset_test(session,w_set,a_buf);
 	if(del) {
-		if(!ipset_del(session,w_set,a_buf))
-			fprintf(stderr,"%s del err\n", a_buf);
-		else if(debug)
-			fprintf(stderr,"%s deleted\n", a_buf);
+		if(e) {
+			if(!ipset_del(session,w_set,a_buf))
+				fprintf(stderr,"%s del err\n", a_buf);
+			else if(debug)
+				fprintf(stderr,"%s deleted\n", a_buf);
+		} else if (debug) fprintf(stderr,"%s not exist\n", a_buf);
 	} else {
-		if(!ipset_add(session,w_set,a_buf))
-			fprintf(stderr,"%s add err\n", a_buf);
-		else if(debug)
-			fprintf(stderr,"%s added\n", a_buf);
+		if(!e) {
+			if(!ipset_add(session,w_set,a_buf))
+				fprintf(stderr,"%s add err\n", a_buf);
+			else if(debug)
+				fprintf(stderr,"%s added\n", a_buf);
+		} else if (debug) fprintf(stderr,"%s exist\n", a_buf);
 	}
 }
 
