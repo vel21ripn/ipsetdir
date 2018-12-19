@@ -15,7 +15,11 @@
 int ipset_session_restart(struct ipset_session **session) {
 if(*session)
 		ipset_session_fini(*session);
+#if IPSET_PROTOCOL == 7
+*session = ipset_session_init(NULL,NULL);
+#else
 *session = ipset_session_init(printf);
+#endif
 return *session != NULL;
 }
 
@@ -182,8 +186,11 @@ int ipset_destroy(struct ipset_session *session,char *setname) {
 
 	return ret == 0;
 }
-
+#if IPSET_PROTOCOL == 7
+static int _ipset_print_file(struct ipset_session *session,void *p, const char *fmt, ...)
+#else
 static int _ipset_print_file(const char *fmt, ...)
+#endif
 {
      int len;
      va_list args;
@@ -203,7 +210,11 @@ int ipset_list(struct ipset_session **session,char *setname) {
 	ipset_session_restart(session);
 
 	ret = ipset_parse_setname(*session, IPSET_SETNAME, setname);
+#if IPSET_PROTOCOL == 7
+	ipset_session_print_outfn(*session, _ipset_print_file,NULL);
+#else
 	ipset_session_outfn(*session, _ipset_print_file);
+#endif
 	if(ret >= 0)
 		ret = ipset_cmd(*session, IPSET_CMD_LIST , restore_line);
 
@@ -219,7 +230,11 @@ int ipset_save(struct ipset_session **session,char *setname) {
 	ipset_session_restart(session);
 
 	ret = ipset_parse_setname(*session, IPSET_SETNAME, setname);
+#if IPSET_PROTOCOL == 7
+	ipset_session_print_outfn(*session, _ipset_print_file,NULL);
+#else
 	ipset_session_outfn(*session, _ipset_print_file);
+#endif
 	if(ret >= 0)
 		ret = ipset_cmd(*session, IPSET_CMD_SAVE , restore_line);
 
@@ -285,7 +300,11 @@ struct ipset_session *session;
 
 _ipset_adt_verbose = 0x4000;
 ipset_load_types();
+#if IPSET_PROTOCOL == 7
+session = ipset_session_init(NULL,NULL);
+#else
 session = ipset_session_init(printf);
+#endif
 
 if(!session) abort();
 if(!ipset_session_restart(&session)) abort();
