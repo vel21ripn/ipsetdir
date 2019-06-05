@@ -12,6 +12,8 @@
 
 #define STREQ(a, b)             (strcmp(a, b) == 0)
 
+char *ipset_list_mem_data = NULL;
+
 int ipset_session_restart(struct ipset_session **session) {
 if(*session)
 		ipset_session_fini(*session);
@@ -203,7 +205,37 @@ static int _ipset_print_file(const char *fmt, ...)
      return len;
 }
 
-int ipset_list(struct ipset_session **session,char *setname) {
+#if IPSET_PROTOCOL == 7
+static int _ipset_print_mem(struct ipset_session *session,void *p, const char *fmt, ...)
+#else
+static int _ipset_print_mem(const char *fmt, ...)
+#endif
+{
+     int len,old_len;
+     va_list args;
+	 char *data;
+
+     va_start(args, fmt);
+	 data = va_arg(args,char *);
+	 if(data && !strcmp(fmt,"%s")) {
+		len = strlen(data);
+		if(len > 0) {
+			old_len = ipset_list_mem_data ? strlen(ipset_list_mem_data):0;
+			if(!ipset_list_mem_data) {
+					ipset_list_mem_data = strdup(data);
+			} else {
+					ipset_list_mem_data = realloc(ipset_list_mem_data,old_len + len + 1);
+					if(ipset_list_mem_data)
+							strcpy(ipset_list_mem_data+old_len,data);
+			}
+//		 	printf("ipset_print fmt %s %d\n",fmt,len);
+		}
+	 } else len = 0;
+     va_end(args);
+     return len;
+}
+
+int ipset_list(struct ipset_session **session,char *setname,int to_mem) {
 	int ret;
 	static uint32_t restore_line=0;
 
@@ -211,10 +243,16 @@ int ipset_list(struct ipset_session **session,char *setname) {
 
 	ret = ipset_parse_setname(*session, IPSET_SETNAME, setname);
 #if IPSET_PROTOCOL == 7
-	ipset_session_print_outfn(*session, _ipset_print_file,NULL);
+	ipset_session_print_outfn(*session,
+					to_mem ? _ipset_print_mem : _ipset_print_file,NULL);
 #else
-	ipset_session_outfn(*session, _ipset_print_file);
+	ipset_session_outfn(*session,
+					to_mem ? _ipset_print_mem : _ipset_print_file);
 #endif
+	if(to_mem && ipset_list_mem_data) {
+			free(ipset_list_mem_data);
+			ipset_list_mem_data = NULL;
+	}
 	if(ret >= 0)
 		ret = ipset_cmd(*session, IPSET_CMD_LIST , restore_line);
 

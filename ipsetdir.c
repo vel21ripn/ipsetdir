@@ -38,14 +38,14 @@ int w_dir_last = 0;
 
 char pid_file[256]="";
 int pid_file_ok = 0;
-
+int init_set = 0;
+static volatile int restarted = 0;
 char *w_dir = NULL, *w_set = NULL, *w_type="hash:ip";
 
 struct ipset_session *session = NULL;
 
 volatile int work = 1;
 int debug = 0;
-static time_t last_wakeup = 0;
 
 #define N_PEERS 8
 #define N_LIST 8
@@ -56,35 +56,46 @@ struct peer {
 		int					psock;
 		int					ssock;
 		time_t				ptime;
-		int					master;
-		int					seq;
+		int					master; // 2 - All data received, 1 - wait events
+		int					seq; // 0 - init state
 };
 
 struct app_cfg {
-		int		ping;
-		struct pollfd fds[N_LIST+1];
-		int		n_list;
-		int		n_peer;
-		int		n_master;
-		struct sockaddr_in list[N_LIST];
-		struct peer peers[N_PEERS];
-		char	key[32];
-		int		key_len;
-		uint32_t port;
+		int					ping;
+		struct sockaddr_in	list[N_LIST];
+		struct pollfd		fds[N_LIST+1];
+		int					n_list;
+		int					n_peer;
+		int					n_master;
+		struct peer			peers[N_PEERS];
+		char				key[32];
+		int					key_len;
+		uint32_t			port;
 } CFG;
 
 struct one_string {
-    struct one_string *next;
-    size_t      len; // length of origin string
-    char		x; // for compare
-	char        data[0];
+    struct one_string 	   *next;
+    size_t			 		len; // length of origin string
+    char					old; // for compare
+	char					data[0];
 };
 
 typedef struct one_string one_string_t ;
 
-one_string_t *LIST = NULL;
+one_string_t LIST = { .next = NULL, .len = 0 };
 
-static int event_handler(char *f_name,int del);
+#define OP_ADD 0
+#define OP_DEL 1
+#define DO_IPSET 1
+#define NO_IPSET 0
+static int ipset_op(char *f_name,int op);
+
+static inline int is_master(void) {
+		return CFG.n_master == 0 && CFG.n_peer;
+}
+static inline int is_peer(void) {
+		return CFG.n_master;
+}
 
 static void fix_char(char *str) {
   for(;str && *str;str++) {
@@ -234,42 +245,38 @@ static one_string_t *alloc_one_string(const char *str,size_t len) {
     if(!r) return r;
     r->next = NULL;
     r->len = len;
-	r->x = 0;
+	r->old = 0;
     memcpy(r->data,str,len+1);
     return r;
 }
 
-void add_to_list(char *str) {
+int add_to_list(char *str) {
 	one_string_t *t;
 	one_string_t *r;
 
-	for(t = LIST; t; t = t->next) {
+	for(t = LIST.next; t; t = t->next) {
 		if(!strcmp(str,t->data)) {
-			if(!t->x) fprintf(stderr,"Add: string '%s' exist\n",str);
-			t->x = 0;
-			return;
+			if(!t->old) fprintf(stderr,"Add: string '%s' exist\n",str);
+			t->old = 0;
+			return 0;
 		}
 	}
 
 	r = alloc_one_string(str,0);
-	if(!r) return;
-	r->next = LIST;
-	LIST = r;
+	if(!r) return 0;
+	r->next = LIST.next;
+	LIST.next = r;
+	return 1;
 }
 
 void del_from_list(char *str) {
 	one_string_t *t,*p;
-	for(p = NULL,t = LIST; t; t = t->next) {
+	for(p = &LIST,t = LIST.next; t; p = t, t = t->next) {
 		if(!strcmp(str,t->data)) {
-			if(!p) {
-				LIST = t->next;
-			} else {
-				p->next = t->next;
-			}
+			p->next = t->next;
 			free(t);
 			return;
 		}
-		p = t;
 	}
 	fprintf(stderr,"Delete: string '%s' not exist\n",str);
 }
@@ -355,7 +362,8 @@ int i;
 		if(!strcmp(cmd,"peer:") || !strcmp(cmd,"master:")) {
 			struct peer *P;
 			char *arg2;
-			if(CFG.n_peer >= 16) {
+
+			if(CFG.n_peer >= N_PEERS) {
 				fprintf(stderr,"Too many peers\n");
 				exit(1);
 			}
@@ -366,28 +374,31 @@ int i;
 				exit(1);
 			}
 			if(!valid_ipv4(&P->pa)) {
+				fprintf(stderr,"invalid ipv4 %s\n",arg1);
 				exit(1);
 			}
 			P->pa.sin_family = AF_INET;
 			P->pa.sin_port = CFG.port;
+			P->seq = 0;
+			P->ssock = -1;
+			if(!arg2) {
+					fprintf(stderr,"Missing local address for %s %s\n",cmd,arg1);
+					exit(1);
+			}
+			if(!inet_pton(AF_INET,arg2,&P->la.sin_addr)) {
+				fprintf(stderr,"Bad local peer ipv4 %s\n",arg2);
+				exit(1);
+			}
+
 			if(!strcmp(cmd,"master:")) {
 				P->master = 1;
 				CFG.n_master++;
-			}
-			P->seq = 0;
-			P->ssock = -1;
-			if(arg2) {
-				if(!inet_pton(AF_INET,arg2,&P->la.sin_addr)) {
-					fprintf(stderr,"Bad local peer ipv4 %s\n",arg2);
-					exit(1);
-				}
-				P->ssock = -2;
 			}
 			CFG.n_peer++;
 			continue;
 		}
 		if(!strcmp(cmd,"list:")) {
-			if(CFG.n_list >= 16) {
+			if(CFG.n_list >= N_LIST) {
 				fprintf(stderr,"Too many list\n");
 				exit(1);
 			}
@@ -398,6 +409,7 @@ int i;
 				exit(1);
 			}
 			if(!valid_ipv4(sa)) {
+				fprintf(stderr,"invalid ipv4 %s\n",arg1);
 				exit(1);
 			}
 			sa->sin_family = AF_INET;
@@ -416,7 +428,18 @@ int i;
 			fprintf(stderr,"Error: missing port\n");
 			exit(1);
 	}
-
+	if(!CFG.n_list && CFG.n_peer) {
+			fprintf(stderr,"Error: missing list:\n");
+			exit(1);
+	}
+	if(CFG.n_list && !CFG.n_peer && !CFG.n_master) {
+			fprintf(stderr,"Error: missing master: or peer:\n");
+			exit(1);
+	}
+	if(CFG.n_peer && CFG.n_master > 0 && CFG.n_master != CFG.n_peer) {
+			fprintf(stderr,"Error: cant master and peer!\n");
+			exit(1);
+	}
 	for(i=0; i < CFG.n_list; i++) {
 		int sock = socket(PF_INET,SOCK_DGRAM,0);
 		if(sock < 0) {
@@ -431,25 +454,17 @@ int i;
 		CFG.fds[i+1].events = POLLIN | POLLERR | POLLHUP | POLLNVAL;
 	}
 	for(i=0; i < CFG.n_peer; i++) {
-		if(CFG.n_list == 0) {
-			fprintf(stderr,"Error: no listen address\n");
-			exit(1);
+		int j;
+		struct sockaddr_in *la = &CFG.peers[i].la;
+		for(j=0; j < CFG.n_list; j++) {
+			sa = &CFG.list[j];
+			if(!memcmp((char *)&sa->sin_addr,(char *)&la->sin_addr,sizeof(sa->sin_addr))) {
+				CFG.peers[i].ssock = CFG.fds[j+1].fd;
+			}
 		}
-		if(CFG.peers[i].ssock != -2) {
-			CFG.peers[i].ssock = CFG.fds[1].fd;
-		} else {
-			int j;
-			struct sockaddr_in *la = &CFG.peers[i].la;
-			for(j=0; j < CFG.n_list; j++) {
-				sa = &CFG.list[j];
-				if(!memcmp((char *)&sa->sin_addr,(char *)&la->sin_addr,sizeof(sa->sin_addr))) {
-					CFG.peers[i].ssock = CFG.fds[j+1].fd;
-				}
-			}
-			if(CFG.peers[i].ssock < 0) {
-				fprintf(stderr,"Error: local address %s not found\n",inet_ntoa(la->sin_addr));
-				exit(1);
-			}
+		if(CFG.peers[i].ssock < 0) {
+			fprintf(stderr,"Error: local address %s not found\n",inet_ntoa(la->sin_addr));
+			exit(1);
 		}
 	}
 
@@ -465,9 +480,9 @@ void send_all(int fd,struct sockaddr_in *sa, time_t ct) {
 	
 	*(time_t *)&buf[0] = ct;
 	memcpy(&buf[4],"ALL ",4);
-	*(uint32_t *)&buf[8] = 0;
+	*(uint32_t *)&buf[8] = 1;
 	p = 12;
-	for(t = LIST; t; t = t->next) {
+	for(t = LIST.next; t; t = t->next) {
 		if(p + t->len+1 >= max) break;
 		memcpy(&buf[p],t->data,t->len+1);
 		p += t->len+1;
@@ -476,7 +491,7 @@ void send_all(int fd,struct sockaddr_in *sa, time_t ct) {
 	sendto(fd,net_buf,p,0,(struct sockaddr *)sa,sizeof(*sa));
 }
 
-void send_diff(char *str,int del) {
+void send_diff(char *str,int op) {
 	char *buf = net_buf;
 	struct sockaddr_in *sa;
 	int i,p,l;
@@ -491,52 +506,62 @@ void send_diff(char *str,int del) {
 		memcpy(&buf[4],"EVNT",4);
 		*(uint32_t *)&buf[8] = ++CFG.peers[i].seq;
 		p = 12;
-		buf[p++] = del ? '-':'+';
+		buf[p++] = op == OP_DEL ? '-':'+';
 		memcpy(&buf[p],str,l);
 		p += l;
 		sa = &CFG.peers[i].pa;
 		l_crypt((uint8_t *)(net_buf+4),p-4,tm,(uint8_t *)CFG.key,CFG.key_len);
 		if(debug)
-		  fprintf(stderr,"Send peer %d: %s %s\n", i,
-						  del ? "DEL":"ADD", str);
+			fprintf(stderr,"Send peer %d: %s %s\n", i, op == OP_DEL ? "DEL":"ADD", str);
 		sendto(CFG.peers[i].psock,net_buf,p,0,
 						(struct sockaddr *)sa,sizeof(struct sockaddr_in));
 	}
 }
 
-static void mark_all(void) {
+static void mark_old(void) {
 	one_string_t *t;
-	for(t=LIST; t; t = t->next) {
-		if(debug)
-			fprintf(stderr,"Mark '%s'\n",&t->data[0]);
-		t->x = 1;
+	for(t=LIST.next; t; t = t->next) {
+		if(debug & 0) fprintf(stderr,"Mark '%s'\n",&t->data[0]);
+		t->old = 1;
 	}
 }
 
-static void delete_marked(void) {
+static void delete_old(int do_ipset) {
 	one_string_t *t,*p;
-	p = NULL;
-	t = LIST;
-	while( t ) {
-		if(t->x) {
+	for(t = LIST.next,p = &LIST; t; ) {
+		if(t->old) {
 			if(debug)
-				fprintf(stderr,"Delete '%s'\n",&t->data[0]);
-			event_handler(&t->data[0],2);
-			if(p) {
-				p->next = t->next;
-				free(t);
-				t = p->next;
-				continue;
-			} else {
-				LIST = t->next;
-				free(t);
-				t = LIST;
-				continue;
-			}
+				fprintf(stderr,"Delete old '%s'\n",&t->data[0]);
+			if(do_ipset == DO_IPSET) 
+				ipset_op(&t->data[0],OP_DEL);
+			p->next = t->next;
+			free(t);
+			t = p->next;
+		} else {
+			p = t;
+			t = t->next;
 		}
-		p = t;
-		t = t->next;
 	}
+}
+
+static void reload_ipset_list(char *wset) {
+	char *l1,*ld;
+	int xl = strlen(w_set)+1;
+	ipset_list(&session,w_set,1);
+	mark_old();
+	l1 = strtok(ipset_list_mem_data,"\n");
+	while((ld = strtok(NULL,"\n")) != NULL) {
+		l1 = strstr(ld,w_set);
+		if(l1) {
+			l1 += xl;
+			add_to_list(l1);
+		}
+	}
+	if(ipset_list_mem_data) {
+		free(ipset_list_mem_data);
+		ipset_list_mem_data = NULL;
+	}
+	delete_old(NO_IPSET);
 }
 
 static void recv_all(char *buf,int len) {
@@ -546,32 +571,51 @@ static void recv_all(char *buf,int len) {
 			return;
 	}
 	p = 12;
-	mark_all();
+	mark_old();
 	while(p < max && p < len) {
 		l = strlen(&buf[p]);
 		if(!l || p+l > len) break;
 		if(debug)
 			fprintf(stderr,"ADD %s\n",&buf[p]);
-		event_handler(&buf[p],0);
+		if(ipset_op(&buf[p],OP_ADD))
+			add_to_list(&buf[p]);
 		p += l+1;
 	}
-	delete_marked();
+	delete_old(DO_IPSET);
 }
 
 static void recv_diff(char *buf,int len,int peer) {
 	int p,l;
 	int max = 65536-16;
-	if(len < 12) {
+	int op;
+
+	if(len < 12)
 		return;
-	}
+
 	p = 12;
 	while(p < max && p < len) {
 		l = strlen(&buf[p]);
 		if(!l) break;
+		if(buf[p] == '-') {
+			op = OP_DEL;
+			p++;
+			l--;
+		} else if(buf[p] == '+') {
+			op = OP_ADD;
+			p++;
+			l--;
+		} else {
+			op = OP_ADD;
+		}
 		if(debug)
-		  fprintf(stderr,"%s %s\n", buf[p] == '-' ? "DEL":"ADD",
-						&buf[p+1]);
-		event_handler(&buf[p+1],buf[p] == '-');
+		  fprintf(stderr,"%s %s\n", op == OP_DEL ? "DEL":"ADD", &buf[p]);
+		if(op == OP_DEL) {
+			if(ipset_op(&buf[p],OP_DEL))
+				del_from_list(&buf[p]);
+		} else {
+			if(ipset_op(&buf[p],OP_ADD))
+				add_to_list(&buf[p]);
+		}
 		p += l+1;
 	}
 }
@@ -582,86 +626,86 @@ static void net_event(int i) {
 	struct sockaddr_in *sa;
 	int l,n;
 	uint32_t ct;
+	uint32_t rseq;
 	socklen_t ral;
 
-	if(0 && debug)
-		fprintf(stderr,"Listen:%d event:%x\n",i-1,CFG.fds[i].revents);
+	if(debug & 0x1)
+		fprintf(stderr,"Listen:%d event:%x\n",i,CFG.fds[i].revents);
 
-	if(CFG.fds[i].revents & POLLIN) {
-		ral = sizeof(ra);
-		l=recvfrom(CFG.fds[i].fd,buf,sizeof(buf),0,(struct sockaddr *)&ra,&ral);
-		if(l < 0) { perror("recv"); return;}
-		for(n = 0; n < CFG.n_peer; n++) {
-			sa = &CFG.peers[n].pa;
-			if(!memcmp((char *)&sa->sin_addr,(char *)&ra.sin_addr,sizeof(ra.sin_addr))) {
-				CFG.peers[n].psock = CFG.fds[i].fd;
-				break;
-			}
-		}
-		if(debug && 0)
-			fprintf(stderr,"from %s:%d peer:%d len:%d\n",
-							inet_ntoa(ra.sin_addr),htons(ra.sin_port),n,l);
-		if(n >= CFG.n_peer) {
-			fprintf(stderr,"Unknown peer\n");
-			return;
-		}
-		if(l < 12) return;
-		ct = *(uint32_t *)&buf[0];
-		l_crypt((uint8_t*)&buf[4],l-4,ct,(uint8_t *)CFG.key,CFG.key_len);
+	ral = sizeof(ra);
+	l=recvfrom(CFG.fds[i].fd,buf,sizeof(buf),0,(struct sockaddr *)&ra,&ral);
+	if(l < 0) { perror("recv"); return;}
 
-		if(CFG.n_master == 0) {
-			if(l == 12) {
-				if(!strncmp(&buf[4],"INIT",4)) {
-					fprintf(stderr,"Peer %d: INIT!\n",n);
-					send_all(CFG.fds[i].fd,&ra,ct-3);
-					CFG.peers[n].seq = 1;
-				}
-				if(!strncmp(&buf[4],"PING",4)) {
-					uint32_t rseq = *(uint32_t *)&buf[8];
-					fprintf(stderr,"Peer %d: PING seq %u\n",n,rseq);
-					strncpy(&buf[4],"PONG",4);
-					ct -= 3;
-					*(uint32_t *)&buf[0] = ct;
-					*(uint32_t *)&buf[8] = ++CFG.peers[n].seq;
-					l_crypt((uint8_t *)&buf[4],l-4,ct,(uint8_t *)CFG.key,CFG.key_len);
-					sendto(CFG.fds[i].fd,buf,l,0,(struct sockaddr *)&ra,ral);
-				}
-				CFG.peers[n].ptime = time(NULL);
-				CFG.peers[n].ssock = CFG.fds[i].fd;
-			}
-		} else {
-			uint32_t rseq = *(uint32_t *)&buf[8];
-			if(!memcmp(&buf[4],"ALL ",4)) {
-				fprintf(stderr,"Peer %d: ALL info\n",n);
-				recv_all(buf,l);	
-				if(CFG.peers[n].master == 1) CFG.peers[n].master = 2;
+	for(n = 0; n < CFG.n_peer; n++) {
+		sa = &CFG.peers[n].pa;
+		if(!memcmp((char *)&sa->sin_addr,(char *)&ra.sin_addr,sizeof(ra.sin_addr))) {
+			CFG.peers[n].psock = CFG.fds[i].fd;
+			break;
+		}
+	}
+	if(debug & 0x2)
+		fprintf(stderr,"from %s:%d peer:%d len:%d\n",
+						inet_ntoa(ra.sin_addr),htons(ra.sin_port),n,l);
+	if(n >= CFG.n_peer) {
+		if(debug) fprintf(stderr,"Unknown peer\n");
+		return;
+	}
+	if(l < 12) return;
+	ct = *(uint32_t *)&buf[0];
+	l_crypt((uint8_t*)&buf[4],l-4,ct,(uint8_t *)CFG.key,CFG.key_len);
+
+	rseq = *(uint32_t *)&buf[8];
+
+	if(is_master()) {
+		if(l == 12) {
+			ct -= 3; // ?
+			if(!strncmp(&buf[4],"INIT",4)) {
+				fprintf(stderr,"Peer %d: INIT!\n",n);
+				send_all(CFG.fds[i].fd,&ra,ct);
 				CFG.peers[n].seq = 1;
+			} else
+			if(!strncmp(&buf[4],"PING",4)) {
+				fprintf(stderr,"Peer %d: PING seq %u\n",n,rseq);
+				memcpy(&buf[4],"PONG",4);
+				*(uint32_t *)&buf[0] = ct;
+				*(uint32_t *)&buf[8] = ++CFG.peers[n].seq;
+				l_crypt((uint8_t *)&buf[4],l-4,ct,(uint8_t *)CFG.key,CFG.key_len);
+				sendto(CFG.fds[i].fd,buf,l,0,(struct sockaddr *)&ra,ral);
+			} else {
+				if(debug) fprintf(stderr,"Unknown command\n");
+				return;
+			}
+			CFG.peers[n].ptime = time(NULL);
+			CFG.peers[n].ssock = CFG.fds[i].fd;
+		}
+	} else { // peer
+		uint32_t rseq = *(uint32_t *)&buf[8];
+		if(!memcmp(&buf[4],"ALL ",4)) {
+			fprintf(stderr,"Peer %d: ALL info\n",n);
+			recv_all(buf,l);	
+			CFG.peers[n].seq = 1;
+			CFG.peers[n].ptime = time(NULL);
+		} else {
+			if(CFG.peers[n].seq+1 != rseq) {
+				fprintf(stderr,"Peer %d: %.4s seq %u:%u BAD! reINIT\n",
+								n,&buf[4],rseq,CFG.peers[n].seq);
+				CFG.peers[n].ptime = 0;
+				CFG.peers[n].seq = 0;
+				return;
 			}
 			if(!memcmp(&buf[4],"PONG",4)) {
-				if(CFG.peers[n].seq != rseq) {
-					CFG.peers[n].master = 1;
-					last_wakeup = 0;
-					fprintf(stderr,"Peer %d: PONG! seq %u:%u BAD! reINIT\n",n,rseq,CFG.peers[n].seq);
-					CFG.peers[n].seq = 0;
-				} else
-					fprintf(stderr,"Peer %d: PONG! seq %u OK\n",n,rseq);
+				if(debug) fprintf(stderr,"Peer %d: PONG! seq %u OK\n",n,rseq);
+			} else if(!memcmp(&buf[4],"EVNT",4)) {
+				if(debug) fprintf(stderr,"Peer %d: EVNT! seq %u OK\n",n,rseq);
+				recv_diff(buf,l,n);
+			} else {
+				fprintf(stderr,"Peer %d: unknown command!\n",n);
+				return;
 			}
-			if(!memcmp(&buf[4],"EVNT",4)) {
-				fprintf(stderr,"Peer %d: EVNT! seq %u:%u\n",n,rseq,CFG.peers[n].seq);
-				if(CFG.peers[n].seq+1 != rseq) {
-					CFG.peers[n].master = 1;
-					last_wakeup = 0;
-				} else {
-					recv_diff(buf,l,n);
-					CFG.peers[n].seq++;
-				}
-			}
+			CFG.peers[n].seq++;
+			CFG.peers[n].ptime = time(NULL);
 		}
-	} else {
-		fprintf(stderr,"event %x\n",CFG.fds[i].revents);
 	}
-
-	CFG.fds[i].revents = 0;
 }
 
 static void net_wakeup_master() {
@@ -669,16 +713,17 @@ static void net_wakeup_master() {
 	struct sockaddr_in *sa;
 	int i;
 	time_t tm = time(NULL);
-	if(last_wakeup && tm - last_wakeup < CFG.ping) return;
-	last_wakeup = tm;
 
-	if(CFG.n_list <= 1) return;
+	if(!CFG.n_list) return;
 
 	for(i=0; i < CFG.n_peer; i++) {
-		if(!CFG.peers[i].master) continue;
+		if(!CFG.peers[i].master) continue; // ?
+
+		if(CFG.peers[i].ptime && CFG.peers[i].ptime + CFG.ping > tm) continue;
+
 		sa = &CFG.peers[i].pa;
 		*(time_t *)&sbuf[0] = tm;
-		if(CFG.peers[i].master == 1) {
+		if(CFG.peers[i].seq == 0) {
 			if(debug)
 				fprintf(stderr,"Master:%s send INIT\n",inet_ntoa(sa->sin_addr));
 			strcpy(&sbuf[4],"INIT");
@@ -690,14 +735,14 @@ static void net_wakeup_master() {
 				fprintf(stderr,"Master:%s send PING seq %u\n",inet_ntoa(sa->sin_addr),CFG.peers[i].seq+1);
 			strcpy(&sbuf[4],"PING");
 
-			*(uint32_t *)&sbuf[8] = ++CFG.peers[i].seq; // > 0
+			*(uint32_t *)&sbuf[8] = CFG.peers[i].seq; // > 0
 			l_crypt((uint8_t *)&sbuf[4],8,tm,(uint8_t *)CFG.key,CFG.key_len);
 			sendto(CFG.peers[i].ssock,sbuf,12,0,(struct sockaddr *)sa,sizeof(*sa));
 		}
 	}
 }
 
-static int event_handler(char *f_name,int del) {
+static int ipset_op(char *f_name, int op) {
   char a_buf[64];
   int e;
   int ret = 0;
@@ -709,31 +754,36 @@ static int event_handler(char *f_name,int del) {
 		return ret;
 	}
 	e = ipset_test(session,w_set,a_buf);
-	if(del) {
+	if(op == OP_DEL) {
 		if(e) {
-			if(!ipset_del(session,w_set,a_buf))
+			if(!ipset_del(session,w_set,a_buf)) {
 				fprintf(stderr,"%s del err\n", a_buf);
-			else { if(debug)
-				fprintf(stderr,"%s deleted\n", a_buf);
-				if(CFG.n_master == 0)
-						send_diff(a_buf,1);
+			} else { 
+				if(debug)
+					fprintf(stderr,"%s deleted from set\n", a_buf);
+//				if(is_master())
+//						send_diff(a_buf,1);
 				ret = 1;
 			}
-		} else if (debug) fprintf(stderr,"%s not exist\n", a_buf);
-		if(del == 1)
-				del_from_list(a_buf);
-	} else {
+		} else {
+			if (debug) fprintf(stderr,"%s not exist\n", a_buf);
+			ret = 1;
+		}
+	} else { // OP_ADD
 		if(!e) {
-			if(!ipset_add(session,w_set,a_buf))
+			if(!ipset_add(session,w_set,a_buf)) {
 				fprintf(stderr,"%s add err\n", a_buf);
-			else { if(debug)
-				fprintf(stderr,"%s added\n", a_buf);
-				if(CFG.n_master == 0)
-						send_diff(a_buf,0);
+			} else { 
+				if(debug)
+					fprintf(stderr,"%s added to set\n", a_buf);
+//				if(is_master())
+//						send_diff(a_buf,0);
 				ret = 1;
 			}
-		} else if (debug) fprintf(stderr,"%s exist\n", a_buf);
-		add_to_list(a_buf);
+		} else {
+			if (debug) fprintf(stderr,"%s exist\n", a_buf);
+			ret = 1;
+		}
 	}
 	return ret;
 }
@@ -762,16 +812,19 @@ if(debug) fprintf(stderr,"Lookup dir %s\n",dir);
 while( --n >= 0) {
 	if(namelist[n]->d_name[0] != '.') {
 		if(is_file(namelist[n]->d_name,dir)) 
-			event_handler(namelist[n]->d_name,0);
+			if(ipset_op(namelist[n]->d_name,OP_ADD))
+				add_to_list(namelist[n]->d_name);
 	}
 	free(namelist[n]);
 }
 free(namelist);
-ipset_session_restart(&session);
+
+//ipset_session_restart(&session);
 }
 
 static void reread_w_dirs(void) {
 int i;
+restarted = 1;
 ipset_flush(session,w_set);
 for(i=0; i < w_dir_last; i++) {
 	prepare_ipset_dir(w_dirs[i],w_set);
@@ -788,7 +841,7 @@ return NULL;
 }
 
 void help(void) {
-fprintf(stderr,"%s [-d] [-F] [-f] [-p pidfile] [-t ipset_type] [-c netconfig ] -s ipset_name dir [dir ...]\n","ipsetdir");
+fprintf(stderr,"%s [-d] [-F] [-f] [-p pidfile] [-t ipset_type] [-c netconfig ] -s ipset_name [dir ...]\n","ipsetdir");
 fprintf(stderr," -d - debug\n -F - no daemonize\n -f - flush set on exit\n"
 		" -p pidfile - use PID file. Default: /run/ipset_dir_<setname>.pid\n"
 		" -s ipset_name - ipset name\n"
@@ -801,7 +854,7 @@ exit(0);
 char event_buff[EVENT_BUF_LEN];
 
 void my_signals(int s) {
-if(s == SIGHUP) {
+if(s == SIGHUP || s == SIGINT) {
 	reread_w_dirs();
 } else {
 	work = 0;
@@ -814,7 +867,6 @@ struct inotify_event * event;
 char *fconfig = NULL;
 int i,fd,wd,len,c;
 int set_flush = 0, dodaemon = 1;
-int del;
 char est[128];
 
 	bzero((char *)&CFG,sizeof(CFG));
@@ -830,7 +882,7 @@ char est[128];
 		exit(1);
 	}
 	while((c=getopt(argc,argv,"dFp:s:t:c:")) != -1) {
-	switch(c) {
+	 switch(c) {
 	  case 'd': debug++; break;
 	  case 'f': set_flush = 1; break;
 	  case 'F': dodaemon = 0; break;
@@ -839,7 +891,7 @@ char est[128];
 	  case 't': w_type = strdup(optarg); break;
 	  case 'c': fconfig = strdup(optarg); break;
 	  default: help();
-	}
+	 }
 	}
 
 	if(fconfig) {
@@ -853,7 +905,7 @@ char est[128];
 			perror("malloc net_buf");
 			exit(1);
 	}
-	if(!w_set || !argv[optind]) 
+	if(!w_set || (is_master() && !argv[optind]))
 		help();
 	
 	if(!pid_file[0])
@@ -875,7 +927,6 @@ char est[128];
 		exit(1);
 	}
 
-	ipset_flush(session,w_set);
 
 	fd = inotify_init();
 	if ( fd < 0 ) {
@@ -883,23 +934,27 @@ char est[128];
 		exit(1);
 	}
 
-	for(i = optind; i < argc; i++) {
-		w_dir = strdup(argv[i]);
-		if(w_dir_last+1 >= W_DIR_MAX) {
-			fprintf(stderr,"Too many watch dirs\n");
-			break;
+	if(is_peer()) {
+		reload_ipset_list(w_set);
+	} else { // master or single
+		ipset_flush(session,w_set);
+		for(i = optind; i < argc; i++) {
+			w_dir = strdup(argv[i]);
+			if(w_dir_last+1 >= W_DIR_MAX) {
+				fprintf(stderr,"Too many watch dirs\n");
+				break;
+			}
+			w_dirs[w_dir_last] = w_dir;
+			prepare_ipset_dir(w_dir,w_set);
+			wd = inotify_add_watch( fd, w_dir, IN_CLOSE_WRITE|IN_DELETE|IN_MOVED_FROM|IN_MOVED_TO );
+			if(wd < 0) {
+				perror("inotify_add_watch");
+				exit(1);
+			}
+			w_dirs_wd[w_dir_last++] = wd;
+			if(debug)
+				fprintf(stderr,"Add watch dir %s\n",w_dir);
 		}
-		w_dirs[w_dir_last] = w_dir;
-		
-		prepare_ipset_dir(w_dir,w_set);
-		wd = inotify_add_watch( fd, w_dir, IN_CLOSE_WRITE|IN_DELETE|IN_MOVED_FROM|IN_MOVED_TO );
-		if(wd < 0) {
-			perror("inotify_add_watch");
-			exit(1);
-		}
-		w_dirs_wd[w_dir_last++] = wd;
-		if(debug)
-			fprintf(stderr,"Add watch dir %s\n",w_dir);
 	}
 	if(dodaemon) {
 		if(daemon(1,0) < 0) {
@@ -922,21 +977,30 @@ char est[128];
 
 	CFG.fds[0].fd = fd;
 	CFG.fds[0].events = POLLIN | POLLOUT | POLLERR | POLLHUP | POLLNVAL;
-	CFG.n_list++;
+	CFG.fds[0].revents = 0;
 
 	if(!CFG.n_master && !CFG.n_peer) CFG.ping = 600;
-
+	restarted = 1;
 	while(work) {
-		if(CFG.n_master) {
-			net_wakeup_master();
+		if(is_master() && restarted) { // On start: send to peer all info
+			uint32_t ct = (uint32_t)time(NULL);
+			restarted = 0;
+			for(i=0; i < CFG.n_peer; i++) {
+				CFG.peers[i].seq = 1;
+				send_all(CFG.peers[i].ssock, &CFG.peers[i].pa, ct);
+			}
 		}
-		len = poll(CFG.fds, CFG.n_list, CFG.ping*1000);
+		if(is_peer())
+				net_wakeup_master();
+
+		len = poll(CFG.fds, CFG.n_list + 1, CFG.ping*1000);
 		if(!len) continue;
 		if(len < 0 && errno == EINTR) {
 			if(debug) fprintf(stderr,"EINTR\n");
 			continue;
 		}
 		if(CFG.fds[0].revents) {
+				int op;
 				len = read(fd,event_buff,sizeof(event_buff));
 				if(len < 0 && errno == EINTR) {
 					if(debug) fprintf(stderr,"EINTR\n");
@@ -944,24 +1008,34 @@ char est[128];
 				}
 				if(len < 0) break;
 				if(len < EVENT_SIZE) break;
-//				if(debug) fprintf(stderr,"Read %d from events FD\n",len);
 
 				for(i = 0; i < len; i += EVENT_SIZE + event->len) {
 					event = (struct inotify_event *)(&event_buff[i]);
 					if(!event->len || EVENT_SIZE + event->len + i > len) break;
-					del = event->mask & (IN_DELETE|IN_MOVED_FROM);
+					op = event->mask & (IN_DELETE|IN_MOVED_FROM) ? OP_DEL:OP_ADD;
 					w_dir = find_wd(event->wd);
-					if(debug)
-						fprintf(stderr,"Dir:%s File:%s Event:%s\n",
-								w_dir,event->name,
-								del ? "DEL":"ADD");
-					if(is_file(event->name,w_dir) || del)
-						event_handler(event->name,del);
+					if(debug) fprintf(stderr,"Dir:%s File:%s Event:%s\n",
+								w_dir,event->name,op == OP_DEL ? "DEL":"ADD");
+					if(op == OP_DEL) {
+							if(ipset_op(event->name,op)) {
+								del_from_list(event->name);
+								send_diff(event->name,op);
+							}
+					} else { // OP_ADD
+						if(is_file(event->name,w_dir))
+							if(ipset_op(event->name,op)) {
+								add_to_list(event->name);
+								send_diff(event->name,op);
+							}
+					}
 				}
+				CFG.fds[0].revents = 0;
 		}
-		for(i=1; i < CFG.n_list; i++) {
-			if(!CFG.fds[i].revents) continue;
-			net_event(i);
+		for(i=1; i <= CFG.n_list; i++) {
+			if(CFG.fds[i].revents) {
+				if(CFG.fds[i].revents & POLLIN) net_event(i);
+				CFG.fds[i].revents = 0;
+			}
 		}
 	}
 	if(set_flush)

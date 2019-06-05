@@ -10,7 +10,8 @@ int ipset_create(struct ipset_session *session,char *setname,char *stype,
 int ipset_rename(struct ipset_session *session,char *setname,char *newname,int swap);
 int ipset_flush(struct ipset_session *session,char *setname);
 int ipset_destroy(struct ipset_session *session,char *setname);
-int ipset_list(struct ipset_session **session,char *setname);
+int ipset_list(struct ipset_session **session,char *setname,int to_mem);
+extern char *ipset_list_mem_data;
 int ipset_save(struct ipset_session **session,char *setname);
 int ipset_validate(struct ipset_session *session,char *setname,char *buf);
 int ipset_test(struct ipset_session *session,char *setname,char *buf);
