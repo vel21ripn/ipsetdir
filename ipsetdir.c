@@ -58,6 +58,9 @@ struct peer {
 		time_t				ptime;
 		int					master; // 2 - All data received, 1 - wait events
 		int					seq; // 0 - init state
+		char				key[32];
+		int					key_len;
+		uint32_t			port;
 };
 
 struct app_cfg {
@@ -299,6 +302,117 @@ static int valid_ipv4(struct sockaddr_in *a) {
 	return 1;
 }
 
+static void parse_ipv4_port(char *arg1,struct sockaddr_in *sa,int port) {
+	char *pp;
+	int pport;
+
+		pp = strchr(arg1,':');
+		if(pp) *pp = 0;
+		if(!inet_pton(AF_INET,arg1,&sa->sin_addr)) {
+			fprintf(stderr,"Bad peer ipv4 %s\n",arg1);
+			exit(1);
+		}
+		if(!valid_ipv4(sa)) {
+			fprintf(stderr,"invalid ipv4 %s\n",arg1);
+			exit(1);
+		}
+		pport = port;
+		if(pp) {
+			pport = strtol(pp+1,NULL,10);
+			if(pport < 1 || pport > 0xffff) {
+				fprintf(stderr,"invalid port %s for %s\n",pp+1,arg1);
+				exit(1);
+			}
+			pport = htons(pport);
+		}
+		sa->sin_family = AF_INET;
+		sa->sin_port = pport;
+		if(pp) *pp = ':';
+		if(debug & 4) fprintf(stderr,"%s: string %s host %s port %u\n",__func__,
+						arg1,inet_ntoa(sa->sin_addr),htons(sa->sin_port));
+
+}
+
+static int all_listen_have_port(void) {
+    int no_port = 0,i;
+    for(i=0; i < CFG.n_list; i++) {
+		if(debug & 4)fprintf(stderr,"local address %s:%d\n",inet_ntoa(CFG.list[i].sin_addr),
+						htons(CFG.list[i].sin_port));
+        if(!CFG.list[i].sin_port) no_port++;
+	}
+	if(debug & 4) fprintf(stderr,"%s: return %d\n",__func__,no_port == 0);
+	return no_port == 0;
+}
+
+static void fix_ports(void) {
+	int i;
+    for(i=0; i < CFG.n_list; i++) {
+        if(!CFG.list[i].sin_port) {
+			if(!CFG.port) {
+				fprintf(stderr,"port undefined\n");
+				exit(1);
+			}
+			CFG.list[i].sin_port = CFG.port;
+		}
+	}
+    for(i=0; i < CFG.n_peer; i++) {
+        if(!CFG.peers[i].pa.sin_port) {
+			if(!CFG.port) {
+				fprintf(stderr,"port undefined\n");
+				exit(1);
+			}
+			CFG.peers[i].pa.sin_port = CFG.port;
+		}
+
+		if(!CFG.peers[i].la.sin_family) {
+			CFG.peers[i].la = CFG.list[0];
+			if(CFG.n_list > 1) {
+				fprintf(stderr,"Warning: set local address %s:%d ",inet_ntoa(CFG.peers[i].la.sin_addr),
+								htons(CFG.peers[i].la.sin_port));
+				fprintf(stderr,"for peer %s:%d\n",inet_ntoa(CFG.peers[i].pa.sin_addr),
+								htons(CFG.peers[i].pa.sin_port));
+			}
+		}
+	}
+}
+
+static void fix_keys(void) {
+	int i;
+    for(i=0; i < CFG.n_peer; i++) {
+        if(!CFG.peers[i].key_len) {
+			CFG.peers[i].key_len  = CFG.key_len;
+			strncpy(CFG.peers[i].key,CFG.key,sizeof(CFG.peers[0].key)-1);
+		}
+	}
+}
+static int find_listen(struct sockaddr_in *la) {
+	int j;
+	struct sockaddr_in *sa;
+
+	for(j=0; j < CFG.n_list; j++) {
+		sa = &CFG.list[j];
+		if(!memcmp((char *)&sa->sin_addr,(char *)&la->sin_addr,sizeof(sa->sin_addr))) {
+			return j;
+		}
+	}
+	return -1;
+}
+static void add_listen(char *arg1) {
+	struct sockaddr_in ta;
+
+	bzero((char *)&ta,sizeof(ta));
+	parse_ipv4_port(arg1,&ta,CFG.port);
+
+	if(find_listen(&ta) >= 0) return;
+
+	if(CFG.n_list >= N_LIST) {
+		fprintf(stderr,"Too many list\n");
+		exit(1);
+	}
+	CFG.list[CFG.n_list] = ta;;
+	CFG.n_list++;
+}
+
 int net_config(char *fc) {
 struct sockaddr_in *sa;
 char cbuf[256],*cmd,*arg1;
@@ -367,27 +481,25 @@ int i;
 				fprintf(stderr,"Too many peers\n");
 				exit(1);
 			}
-			arg2 = strtok(NULL," \t");
 			P = &CFG.peers[CFG.n_peer];
-			if(!inet_pton(AF_INET,arg1,&P->pa.sin_addr)) {
-				fprintf(stderr,"Bad peer ipv4 %s\n",arg1);
-				exit(1);
-			}
-			if(!valid_ipv4(&P->pa)) {
-				fprintf(stderr,"invalid ipv4 %s\n",arg1);
-				exit(1);
-			}
-			P->pa.sin_family = AF_INET;
-			P->pa.sin_port = CFG.port;
 			P->seq = 0;
 			P->ssock = -1;
-			if(!arg2) {
-					fprintf(stderr,"Missing local address for %s %s\n",cmd,arg1);
+
+			parse_ipv4_port(arg1,&P->pa,CFG.port);
+
+			while((arg2 = strtok(NULL," \t")) != NULL) {
+				if(!strncmp(arg2,"local:",6)) {
+					arg2 += 6;
+					parse_ipv4_port(arg2,&P->la,CFG.port);
+					add_listen(arg2);
+				} else if(!strncmp(arg2,"key:",4)) {
+					arg2 += 4;
+					strncpy(P->key,arg2,sizeof(P->key)-1);
+					P->key_len = strlen(P->key);
+				} else {		
+					fprintf(stderr,"%s unknown\n",arg2);
 					exit(1);
-			}
-			if(!inet_pton(AF_INET,arg2,&P->la.sin_addr)) {
-				fprintf(stderr,"Bad local peer ipv4 %s\n",arg2);
-				exit(1);
+				}
 			}
 
 			if(!strcmp(cmd,"master:")) {
@@ -397,24 +509,8 @@ int i;
 			CFG.n_peer++;
 			continue;
 		}
-		if(!strcmp(cmd,"list:")) {
-			if(CFG.n_list >= N_LIST) {
-				fprintf(stderr,"Too many list\n");
-				exit(1);
-			}
-			sa = &CFG.list[CFG.n_list];
-			bzero((char *)sa,sizeof(CFG.list[0]));
-			if(!inet_pton(AF_INET,arg1,&sa->sin_addr)) {
-				fprintf(stderr,"Bad list ipv4 address %s\n",arg1);
-				exit(1);
-			}
-			if(!valid_ipv4(sa)) {
-				fprintf(stderr,"invalid ipv4 %s\n",arg1);
-				exit(1);
-			}
-			sa->sin_family = AF_INET;
-			sa->sin_port = CFG.port;
-			CFG.n_list++;
+		if(!strcmp(cmd,"listen:")) {
+			add_listen(arg1);
 			continue;
 		}
 
@@ -424,12 +520,13 @@ int i;
 	fclose(f);
 
 	if(!CFG.ping) CFG.ping=10;
-	if(!CFG.port) {
+	if(!all_listen_have_port() && !CFG.port) {
 			fprintf(stderr,"Error: missing port\n");
 			exit(1);
 	}
+	fix_ports();
 	if(!CFG.n_list && CFG.n_peer) {
-			fprintf(stderr,"Error: missing list:\n");
+			fprintf(stderr,"Error: missing listen for master/peer\n");
 			exit(1);
 	}
 	if(CFG.n_list && !CFG.n_peer && !CFG.n_master) {
@@ -453,9 +550,14 @@ int i;
 		CFG.fds[i+1].fd = sock;
 		CFG.fds[i+1].events = POLLIN | POLLERR | POLLHUP | POLLNVAL;
 	}
+	fix_keys();
 	for(i=0; i < CFG.n_peer; i++) {
 		int j;
 		struct sockaddr_in *la = &CFG.peers[i].la;
+
+		if(!la->sin_family)
+			*la = CFG.list[0];
+
 		for(j=0; j < CFG.n_list; j++) {
 			sa = &CFG.list[j];
 			if(!memcmp((char *)&sa->sin_addr,(char *)&la->sin_addr,sizeof(sa->sin_addr))) {
@@ -463,7 +565,7 @@ int i;
 			}
 		}
 		if(CFG.peers[i].ssock < 0) {
-			fprintf(stderr,"Error: local address %s not found\n",inet_ntoa(la->sin_addr));
+			fprintf(stderr,"Error: local address %s not listen\n",inet_ntoa(la->sin_addr));
 			exit(1);
 		}
 	}
@@ -471,23 +573,47 @@ int i;
 return 0;
 }
 
+static void dump_peers(void) {
+	int i;
+	for(i=0; i < CFG.n_peer; i++) {
+		struct sockaddr_in *la = &CFG.peers[i].pa;
+
+		fprintf(stderr,"Peer[%d]: %s:%d ",i, inet_ntoa(la->sin_addr),htons(la->sin_port));
+		la = &CFG.peers[i].la;
+		fprintf(stderr,"local: %s:%d key:%s\n",
+						inet_ntoa(la->sin_addr),htons(la->sin_port),CFG.peers[i].key);
+	}
+}
+
 static char *net_buf = NULL;
 
-void send_all(int fd,struct sockaddr_in *sa, time_t ct) {
+static uint32_t csum(const uint8_t *buf,size_t len) {
+	uint32_t r=0;
+	int i;
+	for(i=0; i < len; i++) {
+//		fprintf(stderr,"%c",buf[i] >= ' ' && buf[i] < 128 ? buf[i]:'?');
+		r += (uint32_t)buf[i];
+	}
+//	fprintf(stderr,"=%08x\n",r);
+	return r;
+}
+
+void send_all(int fd,struct sockaddr_in *sa, time_t ct, char *key, size_t key_len) {
 	char *buf = net_buf;
 	int p,max=65536-16;
 	one_string_t *t;
-	
+
 	*(time_t *)&buf[0] = ct;
-	memcpy(&buf[4],"ALL ",4);
-	*(uint32_t *)&buf[8] = 1;
-	p = 12;
+	memcpy(&buf[8],"ALL ",4);
+	*(uint32_t *)&buf[12] = 1;
+	p = 16;
 	for(t = LIST.next; t; t = t->next) {
 		if(p + t->len+1 >= max) break;
 		memcpy(&buf[p],t->data,t->len+1);
 		p += t->len+1;
 	}
-	l_crypt((uint8_t*)(net_buf+4),p-4,ct,(uint8_t *)CFG.key,CFG.key_len);
+	*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),p-8);
+	l_crypt((uint8_t*)(buf+8),p-8,ct,(uint8_t *)key,key_len);
 	sendto(fd,net_buf,p,0,(struct sockaddr *)sa,sizeof(*sa));
 }
 
@@ -503,14 +629,15 @@ void send_diff(char *str,int op) {
 		if(CFG.peers[i].ptime < tm - (CFG.ping*5)/2) continue;
 
 		*(time_t *)&buf[0] = tm;
-		memcpy(&buf[4],"EVNT",4);
-		*(uint32_t *)&buf[8] = ++CFG.peers[i].seq;
-		p = 12;
+		memcpy(&buf[8],"EVNT",4);
+		*(uint32_t *)&buf[12] = ++CFG.peers[i].seq;
+		p = 16;
 		buf[p++] = op == OP_DEL ? '-':'+';
 		memcpy(&buf[p],str,l);
 		p += l;
 		sa = &CFG.peers[i].pa;
-		l_crypt((uint8_t *)(net_buf+4),p-4,tm,(uint8_t *)CFG.key,CFG.key_len);
+		*(uint32_t *)&buf[4] = csum((uint8_t*)(net_buf+8),p-8);
+		l_crypt((uint8_t *)(net_buf+8),p-8,tm,(uint8_t *)CFG.peers[i].key,CFG.peers[i].key_len);
 		if(debug)
 			fprintf(stderr,"Send peer %d: %s %s\n", i, op == OP_DEL ? "DEL":"ADD", str);
 		sendto(CFG.peers[i].psock,net_buf,p,0,
@@ -567,10 +694,10 @@ static void reload_ipset_list(char *wset) {
 static void recv_all(char *buf,int len) {
 	int p,l;
 	int max = 65536-16;
-	if(len < 12) {
+	if(len < 16) {
 			return;
 	}
-	p = 12;
+	p = 16;
 	mark_old();
 	while(p < max && p < len) {
 		l = strlen(&buf[p]);
@@ -589,10 +716,10 @@ static void recv_diff(char *buf,int len,int peer) {
 	int max = 65536-16;
 	int op;
 
-	if(len < 12)
+	if(len < 16)
 		return;
 
-	p = 12;
+	p = 16;
 	while(p < max && p < len) {
 		l = strlen(&buf[p]);
 		if(!l) break;
@@ -650,27 +777,37 @@ static void net_event(int i) {
 		if(debug) fprintf(stderr,"Unknown peer\n");
 		return;
 	}
-	if(l < 12) return;
+	if(l < 16) return;
 	ct = *(uint32_t *)&buf[0];
-	l_crypt((uint8_t*)&buf[4],l-4,ct,(uint8_t *)CFG.key,CFG.key_len);
+	l_crypt((uint8_t*)&buf[8],l-8,ct,(uint8_t *)CFG.peers[n].key,CFG.peers[n].key_len);
 
-	rseq = *(uint32_t *)&buf[8];
+	if(csum((uint8_t*)&buf[8],l-8) != *(uint32_t *)&buf[4]) {
+		if(debug) fprintf(stderr,"Bad csum! calc %08x != %08x\n",
+						csum((uint8_t*)&buf[8],l-8), *(uint32_t *)&buf[4]);
+		return;
+	}
+
+	rseq = *(uint32_t *)&buf[12];
 
 	if(is_master()) {
-		if(l == 12) {
+		if(CFG.fds[i].fd != CFG.peers[n].ssock)
+				fprintf(stderr,"Peer %d: socket fd %d != %d\n",n,
+								CFG.fds[i].fd, CFG.peers[n].ssock);
+		if(l == 16) {
 			ct -= 3; // ?
-			if(!strncmp(&buf[4],"INIT",4)) {
+			if(!strncmp(&buf[8],"INIT",4)) {
 				fprintf(stderr,"Peer %d: INIT!\n",n);
-				send_all(CFG.fds[i].fd,&ra,ct);
+				send_all(CFG.peers[n].ssock, &ra, ct, CFG.peers[n].key,CFG.peers[n].key_len);
 				CFG.peers[n].seq = 1;
 			} else
-			if(!strncmp(&buf[4],"PING",4)) {
+			if(!strncmp(&buf[8],"PING",4)) {
 				fprintf(stderr,"Peer %d: PING seq %u\n",n,rseq);
-				memcpy(&buf[4],"PONG",4);
 				*(uint32_t *)&buf[0] = ct;
-				*(uint32_t *)&buf[8] = ++CFG.peers[n].seq;
-				l_crypt((uint8_t *)&buf[4],l-4,ct,(uint8_t *)CFG.key,CFG.key_len);
-				sendto(CFG.fds[i].fd,buf,l,0,(struct sockaddr *)&ra,ral);
+				memcpy(&buf[8],"PONG",4);
+				*(uint32_t *)&buf[12] = ++CFG.peers[n].seq;
+				*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),l-8);
+				l_crypt((uint8_t *)&buf[8],l-8,ct,(uint8_t *)CFG.peers[n].key,CFG.peers[n].key_len);
+				sendto(CFG.peers[n].ssock, buf,l,0,(struct sockaddr *)&ra,ral);
 			} else {
 				if(debug) fprintf(stderr,"Unknown command\n");
 				return;
@@ -679,8 +816,7 @@ static void net_event(int i) {
 			CFG.peers[n].ssock = CFG.fds[i].fd;
 		}
 	} else { // peer
-		uint32_t rseq = *(uint32_t *)&buf[8];
-		if(!memcmp(&buf[4],"ALL ",4)) {
+		if(!memcmp(&buf[8],"ALL ",4)) {
 			fprintf(stderr,"Peer %d: ALL info\n",n);
 			recv_all(buf,l);	
 			CFG.peers[n].seq = 1;
@@ -693,9 +829,9 @@ static void net_event(int i) {
 				CFG.peers[n].seq = 0;
 				return;
 			}
-			if(!memcmp(&buf[4],"PONG",4)) {
+			if(!memcmp(&buf[8],"PONG",4)) {
 				if(debug) fprintf(stderr,"Peer %d: PONG! seq %u OK\n",n,rseq);
-			} else if(!memcmp(&buf[4],"EVNT",4)) {
+			} else if(!memcmp(&buf[8],"EVNT",4)) {
 				if(debug) fprintf(stderr,"Peer %d: EVNT! seq %u OK\n",n,rseq);
 				recv_diff(buf,l,n);
 			} else {
@@ -726,18 +862,20 @@ static void net_wakeup_master() {
 		if(CFG.peers[i].seq == 0) {
 			if(debug)
 				fprintf(stderr,"Master:%s send INIT\n",inet_ntoa(sa->sin_addr));
-			strcpy(&sbuf[4],"INIT");
-			*(uint32_t *)&sbuf[8] = CFG.peers[i].seq; // 0
-			l_crypt((uint8_t *)&sbuf[4],8,tm,(uint8_t *)CFG.key,CFG.key_len);
-			sendto(CFG.peers[i].ssock,sbuf,12,0,(struct sockaddr *)sa,sizeof(*sa));
+			memcpy(&sbuf[8],"INIT",4);
+			*(uint32_t *)&sbuf[12] = CFG.peers[i].seq; // 0
+			*(uint32_t *)&sbuf[4] = csum((uint8_t*)(sbuf+8),8);
+			l_crypt((uint8_t *)&sbuf[8],8,tm,(uint8_t *)CFG.peers[i].key,CFG.peers[i].key_len);
+			sendto(CFG.peers[i].ssock,sbuf,16,0,(struct sockaddr *)sa,sizeof(*sa));
 		} else {
 			if(debug)
 				fprintf(stderr,"Master:%s send PING seq %u\n",inet_ntoa(sa->sin_addr),CFG.peers[i].seq+1);
-			strcpy(&sbuf[4],"PING");
+			memcpy(&sbuf[8],"PING",4);
 
-			*(uint32_t *)&sbuf[8] = CFG.peers[i].seq; // > 0
-			l_crypt((uint8_t *)&sbuf[4],8,tm,(uint8_t *)CFG.key,CFG.key_len);
-			sendto(CFG.peers[i].ssock,sbuf,12,0,(struct sockaddr *)sa,sizeof(*sa));
+			*(uint32_t *)&sbuf[12] = CFG.peers[i].seq; // > 0
+			*(uint32_t *)&sbuf[4] = csum((uint8_t*)(sbuf+8),8);
+			l_crypt((uint8_t *)&sbuf[8],8,tm,(uint8_t *)CFG.peers[i].key,CFG.peers[i].key_len);
+			sendto(CFG.peers[i].ssock,sbuf,16,0,(struct sockaddr *)sa,sizeof(*sa));
 		}
 	}
 }
@@ -761,8 +899,6 @@ static int ipset_op(char *f_name, int op) {
 			} else { 
 				if(debug)
 					fprintf(stderr,"%s deleted from set\n", a_buf);
-//				if(is_master())
-//						send_diff(a_buf,1);
 				ret = 1;
 			}
 		} else {
@@ -776,8 +912,6 @@ static int ipset_op(char *f_name, int op) {
 			} else { 
 				if(debug)
 					fprintf(stderr,"%s added to set\n", a_buf);
-//				if(is_master())
-//						send_diff(a_buf,0);
 				ret = 1;
 			}
 		} else {
@@ -866,7 +1000,7 @@ int main(int argc,char **argv) {
 struct inotify_event * event;
 char *fconfig = NULL;
 int i,fd,wd,len,c;
-int set_flush = 0, dodaemon = 1;
+int set_flush = 0, dodaemon = 1, do_dump_peer = 0;
 char est[128];
 
 	bzero((char *)&CFG,sizeof(CFG));
@@ -881,8 +1015,9 @@ char est[128];
 		fprintf(stderr,"Initialize ipset library failed.\n");
 		exit(1);
 	}
-	while((c=getopt(argc,argv,"dFp:s:t:c:")) != -1) {
+	while((c=getopt(argc,argv,"dDFp:s:t:c:")) != -1) {
 	 switch(c) {
+	  case 'D': do_dump_peer++; break;
 	  case 'd': debug++; break;
 	  case 'f': set_flush = 1; break;
 	  case 'F': dodaemon = 0; break;
@@ -899,6 +1034,10 @@ char est[128];
 			fprintf(stderr,"Bad network configuration\n");
 			exit(1);
 		}
+	}
+	if(do_dump_peer) {
+			dump_peers();
+			exit(0);
 	}
 	net_buf = malloc(65536-16);
 	if(!net_buf) {
@@ -987,7 +1126,8 @@ char est[128];
 			restarted = 0;
 			for(i=0; i < CFG.n_peer; i++) {
 				CFG.peers[i].seq = 1;
-				send_all(CFG.peers[i].ssock, &CFG.peers[i].pa, ct);
+				send_all(CFG.peers[i].ssock, &CFG.peers[i].pa, ct,
+								CFG.peers[i].key,CFG.peers[i].key_len);
 			}
 		}
 		if(is_peer())
