@@ -34,19 +34,23 @@
 #define W_DIR_MAX 32
 char *w_dirs[W_DIR_MAX] = { NULL, };
 int   w_dirs_wd[W_DIR_MAX];
-int w_dir_last = 0;
+int   w_dir_last = 0;
 
 char pid_file[256]="";
 int pid_file_ok = 0;
 int init_set = 0;
-static volatile int restarted = 0;
 char *w_dir = NULL, *w_set = NULL, *w_type="hash:ip";
 
 struct ipset_session *session = NULL;
 
-volatile int work = 1;
-int debug = 0;
+static volatile int work = 1;
+static int debug = 0;
 
+static int net_buf_size = 4000; // must be > 1024
+static char *net_buf = NULL;
+static volatile int restarted = 0;
+
+#define MAX_SEQ_NUM 64
 #define N_PEERS 8
 #define N_LIST 8
 
@@ -285,6 +289,7 @@ void del_from_list(char *str) {
 }
 // }}}}
 
+// valid_ipv4() , parse_ipv4_port() {{{{
 static int valid_ipv4(struct sockaddr_in *a) {
 	uint32_t i = htonl(a->sin_addr.s_addr);
 	if((i & 0xF0000000ul) == 0xF0000000ul) {
@@ -306,6 +311,7 @@ static void parse_ipv4_port(char *arg1,struct sockaddr_in *sa,int port) {
 	char *pp;
 	int pport;
 
+		bzero((char *)sa,sizeof(*sa));
 		pp = strchr(arg1,':');
 		if(pp) *pp = 0;
 		if(!inet_pton(AF_INET,arg1,&sa->sin_addr)) {
@@ -332,6 +338,7 @@ static void parse_ipv4_port(char *arg1,struct sockaddr_in *sa,int port) {
 						arg1,inet_ntoa(sa->sin_addr),htons(sa->sin_port));
 
 }
+// }}}}
 
 static int all_listen_have_port(void) {
     int no_port = 0,i;
@@ -476,6 +483,7 @@ int i;
 		if(!strcmp(cmd,"peer:") || !strcmp(cmd,"master:")) {
 			struct peer *P;
 			char *arg2;
+			struct sockaddr_in ta;
 
 			if(CFG.n_peer >= N_PEERS) {
 				fprintf(stderr,"Too many peers\n");
@@ -485,7 +493,16 @@ int i;
 			P->seq = 0;
 			P->ssock = -1;
 
-			parse_ipv4_port(arg1,&P->pa,CFG.port);
+			parse_ipv4_port(arg1,&ta,CFG.port);
+			for(i=0; i < CFG.n_peer; i++) {
+				if(ta.sin_addr.s_addr == CFG.peers[i].pa.sin_addr.s_addr &&
+					ta.sin_port == CFG.peers[i].pa.sin_port) break;
+			}
+			if(i < CFG.n_peer) {
+				fprintf(stderr,"dup master/peer %s\n",arg1);
+				continue;
+			}
+			P->pa = ta;
 
 			while((arg2 = strtok(NULL," \t")) != NULL) {
 				if(!strncmp(arg2,"local:",6)) {
@@ -584,9 +601,6 @@ static void dump_peers(void) {
 						inet_ntoa(la->sin_addr),htons(la->sin_port),CFG.peers[i].key);
 	}
 }
-static int net_buf_size = 1400;
-static char *net_buf = NULL;
-
 static uint32_t csum(const uint8_t *buf,size_t len) {
 	uint32_t r=0;
 	int i;
@@ -818,19 +832,25 @@ static void net_event(int i) {
 				CFG.peers[n].seq = 1;
 			} else
 			if(!strncmp(&buf[8],"PING",4)) {
-				fprintf(stderr,"Peer %d: PING seq %u\n",n,rseq);
-				*(uint32_t *)&buf[0] = ct;
-				memcpy(&buf[8],"PONG",4);
-				*(uint32_t *)&buf[12] = ++CFG.peers[n].seq;
-				*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),l-8);
-				l_crypt((uint8_t *)&buf[8],l-8,ct,(uint8_t *)CFG.peers[n].key,CFG.peers[n].key_len);
-				sendto(CFG.peers[n].ssock, buf,l,0,(struct sockaddr *)&ra,ral);
+				fprintf(stderr,"Peer %d: PING seq %u:%u\n",n,rseq,CFG.peers[n].seq);
+				if(rseq != CFG.peers[n].seq) {
+					fprintf(stderr,"Peer %d: reINIT!\n",n);
+					send_all(CFG.peers[n].ssock, &ra, ct, CFG.peers[n].key,CFG.peers[n].key_len);
+					CFG.peers[n].seq = 1;
+				} else {
+					*(uint32_t *)&buf[0] = ct;
+					memcpy(&buf[8],"PONG",4);
+					*(uint32_t *)&buf[12] = ++CFG.peers[n].seq;
+					*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),l-8);
+					l_crypt((uint8_t *)&buf[8],l-8,ct,(uint8_t *)CFG.peers[n].key,CFG.peers[n].key_len);
+					sendto(CFG.peers[n].ssock, buf,l,0,(struct sockaddr *)&ra,ral);
+				}
 			} else {
 				if(debug) fprintf(stderr,"Unknown command\n");
 				return;
 			}
 			CFG.peers[n].ptime = time(NULL);
-			CFG.peers[n].ssock = CFG.fds[i].fd;
+			// CFG.peers[n].ssock = CFG.fds[i].fd;
 		}
 	} else { // peer
 		if(!memcmp(&buf[8],"ALL",3)) {
@@ -884,7 +904,7 @@ static void net_wakeup_master() {
 
 		sa = &CFG.peers[i].pa;
 		*(time_t *)&sbuf[0] = tm;
-		if(CFG.peers[i].seq == 0) {
+		if(CFG.peers[i].seq == 0 || CFG.peers[i].seq > MAX_SEQ_NUM) {
 			if(debug)
 				fprintf(stderr,"Master:%s send INIT\n",inet_ntoa(sa->sin_addr));
 			memcpy(&sbuf[8],"INIT",4);
@@ -894,7 +914,7 @@ static void net_wakeup_master() {
 			sendto(CFG.peers[i].ssock,sbuf,16,0,(struct sockaddr *)sa,sizeof(*sa));
 		} else {
 			if(debug)
-				fprintf(stderr,"Master:%s send PING seq %u\n",inet_ntoa(sa->sin_addr),CFG.peers[i].seq+1);
+				fprintf(stderr,"Master:%s send PING seq %u\n",inet_ntoa(sa->sin_addr),CFG.peers[i].seq);
 			memcpy(&sbuf[8],"PING",4);
 
 			*(uint32_t *)&sbuf[12] = CFG.peers[i].seq; // > 0
