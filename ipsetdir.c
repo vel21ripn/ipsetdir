@@ -584,7 +584,7 @@ static void dump_peers(void) {
 						inet_ntoa(la->sin_addr),htons(la->sin_port),CFG.peers[i].key);
 	}
 }
-
+static int net_buf_size = 1400;
 static char *net_buf = NULL;
 
 static uint32_t csum(const uint8_t *buf,size_t len) {
@@ -600,7 +600,7 @@ static uint32_t csum(const uint8_t *buf,size_t len) {
 
 void send_all(int fd,struct sockaddr_in *sa, time_t ct, char *key, size_t key_len) {
 	char *buf = net_buf;
-	int p,max=65536-16;
+	int p,max = net_buf_size,seg = 0;
 	one_string_t *t;
 
 	*(time_t *)&buf[0] = ct;
@@ -608,13 +608,27 @@ void send_all(int fd,struct sockaddr_in *sa, time_t ct, char *key, size_t key_le
 	*(uint32_t *)&buf[12] = 1;
 	p = 16;
 	for(t = LIST.next; t; t = t->next) {
-		if(p + t->len+1 >= max) break;
+		if(p + t->len+1 >= max) {
+			memcpy(&buf[8],"ALL",3);
+			buf[11] = seg ? '1':'0';
+			*(uint32_t *)&buf[12] = 1;
+			*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),p-8);
+			l_crypt((uint8_t*)(buf+8),p-8,ct,(uint8_t *)key,key_len);
+			sendto(fd,buf,p,0,(struct sockaddr *)sa,sizeof(*sa));
+			fprintf(stderr,"ALL0 %d\n",p);
+			p = 16;
+			*(time_t *)&buf[0] = ct;
+			memcpy(&buf[8],"ALL2",4);
+			*(uint32_t *)&buf[12] = 1;
+			seg++;
+		}
 		memcpy(&buf[p],t->data,t->len+1);
 		p += t->len+1;
 	}
 	*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),p-8);
+	fprintf(stderr,"%4.4s %d\n",&buf[8],p);
 	l_crypt((uint8_t*)(buf+8),p-8,ct,(uint8_t *)key,key_len);
-	sendto(fd,net_buf,p,0,(struct sockaddr *)sa,sizeof(*sa));
+	sendto(fd,buf,p,0,(struct sockaddr *)sa,sizeof(*sa));
 }
 
 void send_diff(char *str,int op) {
@@ -636,11 +650,11 @@ void send_diff(char *str,int op) {
 		memcpy(&buf[p],str,l);
 		p += l;
 		sa = &CFG.peers[i].pa;
-		*(uint32_t *)&buf[4] = csum((uint8_t*)(net_buf+8),p-8);
-		l_crypt((uint8_t *)(net_buf+8),p-8,tm,(uint8_t *)CFG.peers[i].key,CFG.peers[i].key_len);
+		*(uint32_t *)&buf[4] = csum((uint8_t*)(buf+8),p-8);
+		l_crypt((uint8_t *)(buf+8),p-8,tm,(uint8_t *)CFG.peers[i].key,CFG.peers[i].key_len);
 		if(debug)
 			fprintf(stderr,"Send peer %d: %s %s\n", i, op == OP_DEL ? "DEL":"ADD", str);
-		sendto(CFG.peers[i].psock,net_buf,p,0,
+		sendto(CFG.peers[i].psock,buf,p,0,
 						(struct sockaddr *)sa,sizeof(struct sockaddr_in));
 	}
 }
@@ -691,14 +705,15 @@ static void reload_ipset_list(char *wset) {
 	delete_old(NO_IPSET);
 }
 
-static void recv_all(char *buf,int len) {
+static void recv_all(char *buf,int len,int start,int end) {
 	int p,l;
-	int max = 65536-16;
+	int max = net_buf_size;
 	if(len < 16) {
 			return;
 	}
 	p = 16;
-	mark_old();
+	if(start)
+		mark_old();
 	while(p < max && p < len) {
 		l = strlen(&buf[p]);
 		if(!l || p+l > len) break;
@@ -708,12 +723,13 @@ static void recv_all(char *buf,int len) {
 			add_to_list(&buf[p]);
 		p += l+1;
 	}
-	delete_old(DO_IPSET);
+	if(end)
+		delete_old(DO_IPSET);
 }
 
 static void recv_diff(char *buf,int len,int peer) {
 	int p,l;
-	int max = 65536-16;
+	int max = net_buf_size;
 	int op;
 
 	if(len < 16)
@@ -748,7 +764,7 @@ static void recv_diff(char *buf,int len,int peer) {
 }
 
 static void net_event(int i) {
-	char buf[512];
+	char *buf;
 	struct sockaddr_in ra;
 	struct sockaddr_in *sa;
 	int l,n;
@@ -760,7 +776,8 @@ static void net_event(int i) {
 		fprintf(stderr,"Listen:%d event:%x\n",i,CFG.fds[i].revents);
 
 	ral = sizeof(ra);
-	l=recvfrom(CFG.fds[i].fd,buf,sizeof(buf),0,(struct sockaddr *)&ra,&ral);
+	buf = net_buf;
+	l=recvfrom(CFG.fds[i].fd,buf,net_buf_size,0,(struct sockaddr *)&ra,&ral);
 	if(l < 0) { perror("recv"); return;}
 
 	for(n = 0; n < CFG.n_peer; n++) {
@@ -816,9 +833,17 @@ static void net_event(int i) {
 			CFG.peers[n].ssock = CFG.fds[i].fd;
 		}
 	} else { // peer
-		if(!memcmp(&buf[8],"ALL ",4)) {
-			fprintf(stderr,"Peer %d: ALL info\n",n);
-			recv_all(buf,l);	
+		if(!memcmp(&buf[8],"ALL",3)) {
+			fprintf(stderr,"Peer %d: %4.4s info\n",n,&buf[8]);
+			if(buf[11] == '0') {
+				recv_all(buf,l,1,0);
+			} else if(buf[11] == '1') {
+				recv_all(buf,l,0,0);
+			} else if(buf[11] == '2') {
+				recv_all(buf,l,0,1);
+			} else if(buf[11] == ' ') {
+				recv_all(buf,l,1,1);
+			}
 			CFG.peers[n].seq = 1;
 			CFG.peers[n].ptime = time(NULL);
 		} else {
@@ -1035,11 +1060,15 @@ char est[128];
 			exit(1);
 		}
 	}
+	if(net_buf_size < 256) {
+		fprintf(stderr,"net_buf_size too small!\n");
+		abort();
+	}
 	if(do_dump_peer) {
 			dump_peers();
 			exit(0);
 	}
-	net_buf = malloc(65536-16);
+	net_buf = malloc(net_buf_size+1);
 	if(!net_buf) {
 			perror("malloc net_buf");
 			exit(1);
